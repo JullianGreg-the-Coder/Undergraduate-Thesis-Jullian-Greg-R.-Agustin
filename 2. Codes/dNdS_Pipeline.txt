@@ -1,0 +1,282 @@
+source ~/miniconda3/etc/profile.d/conda.sh
+
+conda config --add channels defaults
+conda config --add channels bioconda
+conda config --add channels conda-forge
+conda config --set channel_priority strict
+conda create -n biotools paml=4.10.10 iqtree -y
+
+conda activate biotools
+
+#1. Rename Alignment Headers
+python3 - <<EOF
+from pathlib import Path
+
+root = Path("/mnt/d/Thesis/Alignments_FASTA")
+fas_files = sorted(root.rglob("*.fas"))
+
+for path in fas_files:
+    prefix = path.stem
+    lines_out = []
+    counter = 1
+    with open(path, "r") as f:
+        for line in f:
+            if line.startswith(">"):
+                lines_out.append(f">{prefix}{counter}\n")
+                counter += 1
+            else:
+                lines_out.append(line)
+    with open(path, "w") as f:
+        f.writelines(lines_out)
+    print(f"{path.parent.name}/{path.name}: {counter-1} headers renamed")
+EOF
+
+
+
+#2. Check for Stop Codons
+python3 - <<EOF
+from pathlib import Path
+
+root = Path("/mnt/d/Thesis2/Alignments_FASTA")
+stop_codons = {"TAA", "TAG", "AGA", "AGG"}
+found_any = False
+
+for fas in sorted(root.rglob("*.fas")):
+    sequences = {}
+    current = None
+    with open(fas) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                current = line[1:]
+                sequences[current] = ""
+            else:
+                sequences[current] += line.upper()
+
+    for name, seq in sequences.items():
+        seq = seq.replace("-", "")
+        for i in range(0, len(seq)-2, 3):
+            codon = seq[i:i+3]
+            if codon in stop_codons:
+                aa_pos = (i // 3) + 1
+                print(f"STOP: {fas.parent.name}/{fas.name} — {name} "
+                      f"nt {i+1}-{i+3}: {codon} (aa pos {aa_pos})")
+                found_any = True
+
+if not found_any:
+    print("No stop codons found in any file.")
+EOF
+
+
+
+#3. Deduplicate FASTA
+python3 - <<EOF
+from pathlib import Path
+import shutil
+
+root = Path("/mnt/d/Thesis/Alignments_FASTA")
+fas_files = sorted([f for f in root.rglob("*.fas")
+                    if "1. No Phylo Tree" not in str(f)])
+
+for fas in fas_files:
+    stem = fas.stem
+    prefix_len = sum(c.isalpha() for c in stem)
+    sequences = {}
+    order = []
+    current = None
+    with open(fas) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                current = line[1:]
+                sequences[current] = ""
+                order.append(current)
+            else:
+                sequences[current] += line.upper()
+
+    seen = {}
+    for name in order:
+        seq = sequences[name]
+        num = int(name[prefix_len:])
+        if seq not in seen or num < seen[seq][0]:
+            seen[seq] = (num, name)
+
+    retained = sorted(seen.values(), key=lambda x: x[0])
+    retained_names = [name for _, name in retained]
+
+    outfile = fas.parent / f"{stem}1.fas"
+    with open(outfile, "w") as f:
+        for name in retained_names:
+            f.write(f">{name}\n")
+            seq = sequences[name]
+            for i in range(0, len(seq), 60):
+                f.write(seq[i:i+60] + "\n")
+
+    print(f"{fas.parent.name}/{fas.name}: {len(order)} → {len(retained_names)} unique")
+
+species_dirs = set(f.parent for f in fas_files)
+for species_dir in sorted(species_dirs):
+    seqdupli = species_dir / "SeqDupli"
+    seqdupli.mkdir(exist_ok=True)
+    for fas in sorted(species_dir.glob("*.fas")):
+        if len(fas.stem) == 2: 
+            shutil.move(str(fas), str(seqdupli / fas.name))
+            print(f"Moved: {fas.name} → SeqDupli/")
+EOF
+
+
+
+#4. No-Bootstrap IQ-TREE
+python3 - <<EOF
+import subprocess, shutil, re
+from pathlib import Path
+
+root = Path("/mnt/d/Thesis/Alignments_FASTA")
+fas_files = sorted([f for f in root.rglob("*1.fas")
+                    if "1. No Phylo Tree" not in str(f)
+                    and "SeqDupli" not in str(f)])
+
+def strip_bl(newick):
+    return re.sub(r":[0-9]+\.?[0-9]*([eE][+-]?[0-9]+)?", "", newick)
+
+for fas in fas_files:
+    stem = fas.stem
+    base = fas.parent
+    nwk_nb = base / "NWK_NoBL"
+    iqt_nb = base / "iqtreeExtra" / stem / "NoBootstrap"
+    bl_dir = iqt_nb / "BranchLengths"
+    for d in [nwk_nb, iqt_nb, bl_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    result = subprocess.run([
+        "iqtree", "-s", str(fas),
+        "-m", "MFP", "-T", "AUTO",
+        "--prefix", str(iqt_nb / stem),
+        "-redo"
+    ], capture_output=True, text=True)
+
+    if result.returncode == 0:
+        treefile = iqt_nb / f"{stem}.treefile"
+        shutil.copy(treefile, bl_dir / f"{stem}.nwk")
+        with open(treefile) as f:
+            newick = f.read().strip()
+        with open(nwk_nb / f"{stem}.nwk", "w") as f:
+            f.write(strip_bl(newick) + "\n")
+        print(f"OK: {stem}")
+    else:
+        print(f"FAILED: {stem}")
+EOF
+
+
+
+#5. FASTA to PHYLIP
+python3 - <<EOF
+from pathlib import Path
+
+root = Path("/mnt/d/Thesis/Alignments_FASTA")
+fas_files = sorted([f for f in root.rglob("*1.fas")
+                    if "1. No Phylo Tree" not in str(f)
+                    and "SeqDupli" not in str(f)])
+
+for fas in fas_files:
+    stem = fas.stem
+    dnds_dir = fas.parent / "dNdS"
+    dnds_dir.mkdir(exist_ok=True)
+    outfile = dnds_dir / f"{stem}.phy"
+
+    sequences = {}
+    order = []
+    current = None
+    with open(fas) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith(">"):
+                current = line[1:]
+                sequences[current] = ""
+                order.append(current)
+            else:
+                sequences[current] += line.upper()
+
+    n_seq = len(order)
+    seq_len = len(sequences[order[0]])
+
+    with open(outfile, "w") as f:
+        f.write(f" {n_seq} {seq_len}\n")
+        for name in order:
+            padded_name = name.ljust(10)[:10]
+            f.write(f"{padded_name}{sequences[name]}\n")
+
+    print(f"OK: {fas.parent.name}/{fas.name} → {n_seq} seqs, {seq_len} bp")
+EOF
+
+
+
+#6. PAML
+python3 - <<EOF
+import subprocess, shutil
+from pathlib import Path
+
+root = Path("/mnt/d/Thesis/Alignments_FASTA")
+fas_files = sorted([f for f in root.rglob("*1.fas")
+                    if "1. No Phylo Tree" not in str(f)
+                    and "SeqDupli" not in str(f)])
+
+ctl_template = """seqfile  = {stem}.phy
+treefile = {stem}.nwk
+outfile  = {stem}.mlc
+
+noisy       = 9
+verbose     = 1
+runmode     = 0
+
+seqtype     = 1
+CodonFreq   = 2
+model       = 0
+NSsites     = 0
+
+icode       = 1
+fix_kappa   = 0
+kappa       = 2
+fix_omega   = 0
+omega       = 0.5
+
+fix_blength = 0
+clock       = 0
+cleandata   = 1
+"""
+
+for fas in fas_files:
+    stem = fas.stem
+    dnds_dir = fas.parent / "dNdS"
+    results_dir = fas.parent / "PAML" / stem
+    results_dir.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy(dnds_dir / f"{stem}.phy", results_dir / f"{stem}.phy")
+    shutil.copy(fas.parent /"NWK_NoBL" / f"{stem}.nwk", results_dir / f"{stem}.nwk")
+
+    with open(results_dir / "codeml.ctl", "w") as f:
+        f.write(ctl_template.format(stem=stem))
+
+    result = subprocess.run(
+        ["codeml", "codeml.ctl"],
+        cwd=str(results_dir),
+        capture_output=True, text=True
+    )
+
+    mlc_file = results_dir / f"{stem}.mlc"
+    if mlc_file.exists() and "omega" in mlc_file.read_text():
+        mlc = mlc_file.read_text()
+        omega, dn, ds = "N/A", "N/A", "N/A"
+        for line in mlc.split("\n"):
+            if "omega (dN/dS)" in line:
+                omega = line.split("=")[1].strip()
+            if "tree length for dN" in line:
+                dn = line.split(":")[1].strip()
+            if "tree length for dS" in line:
+                ds = line.split(":")[1].strip()
+        print(f"OK: {stem} | omega={omega} dN={dn} dS={ds}")
+    else:
+        print(f"FAILED: {stem}")
+EOF
+
+exit
